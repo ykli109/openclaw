@@ -1,4 +1,6 @@
+import fs from "node:fs/promises";
 import { getAcpSessionManager } from "../../acp/control-plane/manager.js";
+import type { AcpTurnAttachment } from "../../acp/control-plane/manager.types.js";
 import { resolveAcpAgentPolicyError, resolveAcpDispatchPolicyError } from "../../acp/policy.js";
 import { formatAcpRuntimeErrorText } from "../../acp/runtime/error-text.js";
 import { toAcpRuntimeError } from "../../acp/runtime/errors.js";
@@ -14,6 +16,11 @@ import { logVerbose } from "../../globals.js";
 import { getSessionBindingService } from "../../infra/outbound/session-binding-service.js";
 import { generateSecureUuid } from "../../infra/secure-random.js";
 import { prefixSystemMessage } from "../../infra/system-message.js";
+import { applyMediaUnderstanding } from "../../media-understanding/apply.js";
+import {
+  normalizeAttachmentPath,
+  normalizeAttachments,
+} from "../../media-understanding/attachments.normalize.js";
 import { resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
 import { maybeApplyTtsToPayload, resolveTtsConfig } from "../../tts/tts.js";
 import {
@@ -22,10 +29,12 @@ import {
   shouldHandleTextCommands,
 } from "../commands-registry.js";
 import type { FinalizedMsgContext } from "../templating.js";
-import type { ReplyPayload } from "../types.js";
 import { createAcpReplyProjector } from "./acp-projector.js";
+import {
+  createAcpDispatchDeliveryCoordinator,
+  type AcpDispatchDeliveryCoordinator,
+} from "./dispatch-acp-delivery.js";
 import type { ReplyDispatcher, ReplyDispatchKind } from "./reply-dispatcher.js";
-import { routeReply } from "./route-reply.js";
 
 type DispatchProcessedRecorder = (
   outcome: "completed" | "skipped" | "error",
@@ -56,6 +65,40 @@ function resolveAcpPromptText(ctx: FinalizedMsgContext): string {
     "RawBody",
     "Body",
   ]).trim();
+}
+
+const ACP_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
+
+async function resolveAcpAttachments(ctx: FinalizedMsgContext): Promise<AcpTurnAttachment[]> {
+  const mediaAttachments = normalizeAttachments(ctx);
+  const results: AcpTurnAttachment[] = [];
+  for (const attachment of mediaAttachments) {
+    const mediaType = attachment.mime ?? "application/octet-stream";
+    if (!mediaType.startsWith("image/")) {
+      continue;
+    }
+    const filePath = normalizeAttachmentPath(attachment.path);
+    if (!filePath) {
+      continue;
+    }
+    try {
+      const stat = await fs.stat(filePath);
+      if (stat.size > ACP_ATTACHMENT_MAX_BYTES) {
+        logVerbose(
+          `dispatch-acp: skipping attachment ${filePath} (${stat.size} bytes exceeds ${ACP_ATTACHMENT_MAX_BYTES} byte limit)`,
+        );
+        continue;
+      }
+      const buf = await fs.readFile(filePath);
+      results.push({
+        mediaType,
+        data: buf.toString("base64"),
+      });
+    } catch {
+      // Skip unreadable files. Text content should still be delivered.
+    }
+  }
+  return results;
 }
 
 function resolveCommandCandidateText(ctx: FinalizedMsgContext): string {
@@ -144,11 +187,129 @@ export type AcpDispatchAttemptResult = {
   counts: Record<ReplyDispatchKind, number>;
 };
 
+const ACP_STALE_BINDING_UNBIND_REASON = "acp-session-init-failed";
+
+function isStaleSessionInitError(params: { code: string; message: string }): boolean {
+  if (params.code !== "ACP_SESSION_INIT_FAILED") {
+    return false;
+  }
+  return /(ACP (session )?metadata is missing|missing ACP metadata|Session is not ACP-enabled|Resource not found)/i.test(
+    params.message,
+  );
+}
+
+async function maybeUnbindStaleBoundConversations(params: {
+  targetSessionKey: string;
+  error: { code: string; message: string };
+}): Promise<void> {
+  if (!isStaleSessionInitError(params.error)) {
+    return;
+  }
+  try {
+    const removed = await getSessionBindingService().unbind({
+      targetSessionKey: params.targetSessionKey,
+      reason: ACP_STALE_BINDING_UNBIND_REASON,
+    });
+    if (removed.length > 0) {
+      logVerbose(
+        `dispatch-acp: removed ${removed.length} stale bound conversation(s) for ${params.targetSessionKey} after ${params.error.code}: ${params.error.message}`,
+      );
+    }
+  } catch (error) {
+    logVerbose(
+      `dispatch-acp: failed to unbind stale bound conversations for ${params.targetSessionKey}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+async function finalizeAcpTurnOutput(params: {
+  cfg: OpenClawConfig;
+  sessionKey: string;
+  delivery: AcpDispatchDeliveryCoordinator;
+  inboundAudio: boolean;
+  sessionTtsAuto?: TtsAutoMode;
+  ttsChannel?: string;
+  shouldEmitResolvedIdentityNotice: boolean;
+}): Promise<boolean> {
+  await params.delivery.settleVisibleText();
+  let queuedFinal =
+    params.delivery.hasDeliveredVisibleText() && !params.delivery.hasFailedVisibleTextDelivery();
+  const ttsMode = resolveTtsConfig(params.cfg).mode ?? "final";
+  const accumulatedBlockText = params.delivery.getAccumulatedBlockText();
+  const hasAccumulatedBlockText = accumulatedBlockText.trim().length > 0;
+
+  let finalMediaDelivered = false;
+  if (ttsMode === "final" && hasAccumulatedBlockText) {
+    try {
+      const ttsSyntheticReply = await maybeApplyTtsToPayload({
+        payload: { text: accumulatedBlockText },
+        cfg: params.cfg,
+        channel: params.ttsChannel,
+        kind: "final",
+        inboundAudio: params.inboundAudio,
+        ttsAuto: params.sessionTtsAuto,
+      });
+      if (ttsSyntheticReply.mediaUrl) {
+        const delivered = await params.delivery.deliver("final", {
+          mediaUrl: ttsSyntheticReply.mediaUrl,
+          audioAsVoice: ttsSyntheticReply.audioAsVoice,
+        });
+        queuedFinal = queuedFinal || delivered;
+        finalMediaDelivered = delivered;
+      }
+    } catch (err) {
+      logVerbose(
+        `dispatch-acp: accumulated ACP block TTS failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // Some ACP parent surfaces only expose terminal replies, so block routing alone is not enough
+  // to prove the final result was visible to the user.
+  const shouldDeliverTextFallback =
+    ttsMode !== "all" &&
+    hasAccumulatedBlockText &&
+    !finalMediaDelivered &&
+    !params.delivery.hasDeliveredFinalReply() &&
+    (!params.delivery.hasDeliveredVisibleText() || params.delivery.hasFailedVisibleTextDelivery());
+  if (shouldDeliverTextFallback) {
+    const delivered = await params.delivery.deliver(
+      "final",
+      { text: accumulatedBlockText },
+      { skipTts: true },
+    );
+    queuedFinal = queuedFinal || delivered;
+  }
+
+  if (params.shouldEmitResolvedIdentityNotice) {
+    const currentMeta = readAcpSessionEntry({
+      cfg: params.cfg,
+      sessionKey: params.sessionKey,
+    })?.acp;
+    const identityAfterTurn = resolveSessionIdentityFromMeta(currentMeta);
+    if (!isSessionIdentityPending(identityAfterTurn)) {
+      const resolvedDetails = resolveAcpThreadSessionDetailLines({
+        sessionKey: params.sessionKey,
+        meta: currentMeta,
+      });
+      if (resolvedDetails.length > 0) {
+        const delivered = await params.delivery.deliver("final", {
+          text: prefixSystemMessage(["Session ids resolved.", ...resolvedDetails].join("\n")),
+        });
+        queuedFinal = queuedFinal || delivered;
+      }
+    }
+  }
+
+  return queuedFinal;
+}
+
 export async function tryDispatchAcpReply(params: {
   ctx: FinalizedMsgContext;
   cfg: OpenClawConfig;
   dispatcher: ReplyDispatcher;
   sessionKey?: string;
+  abortSignal?: AbortSignal;
   inboundAudio: boolean;
   sessionTtsAuto?: TtsAutoMode;
   ttsChannel?: string;
@@ -157,6 +318,7 @@ export async function tryDispatchAcpReply(params: {
   originatingTo?: string;
   shouldSendToolSummaries: boolean;
   bypassForCommand: boolean;
+  onReplyStart?: () => Promise<void> | void;
   recordProcessed: DispatchProcessedRecorder;
   markIdle: (reason: string) => void;
 }): Promise<AcpDispatchAttemptResult | null> {
@@ -173,74 +335,21 @@ export async function tryDispatchAcpReply(params: {
   if (acpResolution.kind === "none") {
     return null;
   }
+  const canonicalSessionKey = acpResolution.sessionKey;
 
-  const routedCounts: Record<ReplyDispatchKind, number> = {
-    tool: 0,
-    block: 0,
-    final: 0,
-  };
   let queuedFinal = false;
-  let acpAccumulatedBlockText = "";
-  let acpBlockCount = 0;
-  const deliverAcpPayload = async (
-    kind: ReplyDispatchKind,
-    payload: ReplyPayload,
-  ): Promise<boolean> => {
-    if (kind === "block" && payload.text?.trim()) {
-      if (acpAccumulatedBlockText.length > 0) {
-        acpAccumulatedBlockText += "\n";
-      }
-      acpAccumulatedBlockText += payload.text;
-      acpBlockCount += 1;
-    }
-
-    const ttsPayload = await maybeApplyTtsToPayload({
-      payload,
-      cfg: params.cfg,
-      channel: params.ttsChannel,
-      kind,
-      inboundAudio: params.inboundAudio,
-      ttsAuto: params.sessionTtsAuto,
-    });
-
-    if (params.shouldRouteToOriginating && params.originatingChannel && params.originatingTo) {
-      const result = await routeReply({
-        payload: ttsPayload,
-        channel: params.originatingChannel,
-        to: params.originatingTo,
-        sessionKey: params.ctx.SessionKey,
-        accountId: params.ctx.AccountId,
-        threadId: params.ctx.MessageThreadId,
-        cfg: params.cfg,
-      });
-      if (!result.ok) {
-        logVerbose(
-          `dispatch-acp: route-reply (acp/${kind}) failed: ${result.error ?? "unknown error"}`,
-        );
-        return false;
-      }
-      routedCounts[kind] += 1;
-      return true;
-    }
-    if (kind === "tool") {
-      return params.dispatcher.sendToolResult(ttsPayload);
-    }
-    if (kind === "block") {
-      return params.dispatcher.sendBlockReply(ttsPayload);
-    }
-    return params.dispatcher.sendFinalReply(ttsPayload);
-  };
-
-  const promptText = resolveAcpPromptText(params.ctx);
-  if (!promptText) {
-    const counts = params.dispatcher.getQueuedCounts();
-    counts.tool += routedCounts.tool;
-    counts.block += routedCounts.block;
-    counts.final += routedCounts.final;
-    params.recordProcessed("completed", { reason: "acp_empty_prompt" });
-    params.markIdle("message_completed");
-    return { queuedFinal: false, counts };
-  }
+  const delivery = createAcpDispatchDeliveryCoordinator({
+    cfg: params.cfg,
+    ctx: params.ctx,
+    dispatcher: params.dispatcher,
+    inboundAudio: params.inboundAudio,
+    sessionTtsAuto: params.sessionTtsAuto,
+    ttsChannel: params.ttsChannel,
+    shouldRouteToOriginating: params.shouldRouteToOriginating,
+    originatingChannel: params.originatingChannel,
+    originatingTo: params.originatingTo,
+    onReplyStart: params.onReplyStart,
+  });
 
   const identityPendingBeforeTurn = isSessionIdentityPending(
     resolveSessionIdentityFromMeta(acpResolution.kind === "ready" ? acpResolution.meta : undefined),
@@ -249,7 +358,7 @@ export async function tryDispatchAcpReply(params: {
     identityPendingBeforeTurn &&
     (Boolean(params.ctx.MessageThreadId != null && String(params.ctx.MessageThreadId).trim()) ||
       hasBoundConversationForSession({
-        sessionKey,
+        sessionKey: canonicalSessionKey,
         channelRaw: params.ctx.OriginatingChannel ?? params.ctx.Surface ?? params.ctx.Provider,
         accountIdRaw: params.ctx.AccountId,
       }));
@@ -259,13 +368,13 @@ export async function tryDispatchAcpReply(params: {
       ? (
           acpResolution.meta.agent?.trim() ||
           params.cfg.acp?.defaultAgent?.trim() ||
-          resolveAgentIdFromSessionKey(sessionKey)
+          resolveAgentIdFromSessionKey(canonicalSessionKey)
         ).trim()
-      : resolveAgentIdFromSessionKey(sessionKey);
+      : resolveAgentIdFromSessionKey(canonicalSessionKey);
   const projector = createAcpReplyProjector({
     cfg: params.cfg,
     shouldSendToolSummaries: params.shouldSendToolSummaries,
-    deliver: deliverAcpPayload,
+    deliver: delivery.deliver,
     provider: params.ctx.Surface ?? params.ctx.Provider,
     accountId: params.ctx.AccountId,
   });
@@ -277,72 +386,86 @@ export async function tryDispatchAcpReply(params: {
       throw dispatchPolicyError;
     }
     if (acpResolution.kind === "stale") {
-      throw acpResolution.error;
+      await maybeUnbindStaleBoundConversations({
+        targetSessionKey: canonicalSessionKey,
+        error: acpResolution.error,
+      });
+      const delivered = await delivery.deliver("final", {
+        text: formatAcpRuntimeErrorText(acpResolution.error),
+        isError: true,
+      });
+      const counts = params.dispatcher.getQueuedCounts();
+      delivery.applyRoutedCounts(counts);
+      const acpStats = acpManager.getObservabilitySnapshot(params.cfg);
+      logVerbose(
+        `acp-dispatch: session=${sessionKey} outcome=error code=${acpResolution.error.code} latencyMs=${Date.now() - acpDispatchStartedAt} queueDepth=${acpStats.turns.queueDepth} activeRuntimes=${acpStats.runtimeCache.activeSessions}`,
+      );
+      params.recordProcessed("completed", {
+        reason: `acp_error:${acpResolution.error.code.toLowerCase()}`,
+      });
+      params.markIdle("message_completed");
+      return { queuedFinal: delivered, counts };
     }
     const agentPolicyError = resolveAcpAgentPolicyError(params.cfg, resolvedAcpAgent);
     if (agentPolicyError) {
       throw agentPolicyError;
     }
-
-    await acpManager.runTurn({
-      cfg: params.cfg,
-      sessionKey,
-      text: promptText,
-      mode: "prompt",
-      requestId: resolveAcpRequestId(params.ctx),
-      onEvent: async (event) => await projector.onEvent(event),
-    });
-
-    await projector.flush(true);
-    const ttsMode = resolveTtsConfig(params.cfg).mode ?? "final";
-    if (ttsMode === "final" && acpBlockCount > 0 && acpAccumulatedBlockText.trim()) {
+    if (!params.ctx.MediaUnderstanding?.length) {
       try {
-        const ttsSyntheticReply = await maybeApplyTtsToPayload({
-          payload: { text: acpAccumulatedBlockText },
+        await applyMediaUnderstanding({
+          ctx: params.ctx,
           cfg: params.cfg,
-          channel: params.ttsChannel,
-          kind: "final",
-          inboundAudio: params.inboundAudio,
-          ttsAuto: params.sessionTtsAuto,
         });
-        if (ttsSyntheticReply.mediaUrl) {
-          const delivered = await deliverAcpPayload("final", {
-            mediaUrl: ttsSyntheticReply.mediaUrl,
-            audioAsVoice: ttsSyntheticReply.audioAsVoice,
-          });
-          queuedFinal = queuedFinal || delivered;
-        }
       } catch (err) {
         logVerbose(
-          `dispatch-acp: accumulated ACP block TTS failed: ${err instanceof Error ? err.message : String(err)}`,
+          `dispatch-acp: media understanding failed, proceeding with raw content: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
     }
 
-    if (shouldEmitResolvedIdentityNotice) {
-      const currentMeta = readAcpSessionEntry({
-        cfg: params.cfg,
-        sessionKey,
-      })?.acp;
-      const identityAfterTurn = resolveSessionIdentityFromMeta(currentMeta);
-      if (!isSessionIdentityPending(identityAfterTurn)) {
-        const resolvedDetails = resolveAcpThreadSessionDetailLines({
-          sessionKey,
-          meta: currentMeta,
-        });
-        if (resolvedDetails.length > 0) {
-          const delivered = await deliverAcpPayload("final", {
-            text: prefixSystemMessage(["Session ids resolved.", ...resolvedDetails].join("\n")),
-          });
-          queuedFinal = queuedFinal || delivered;
-        }
-      }
+    const promptText = resolveAcpPromptText(params.ctx);
+    const attachments = await resolveAcpAttachments(params.ctx);
+    if (!promptText && attachments.length === 0) {
+      const counts = params.dispatcher.getQueuedCounts();
+      delivery.applyRoutedCounts(counts);
+      params.recordProcessed("completed", { reason: "acp_empty_prompt" });
+      params.markIdle("message_completed");
+      return { queuedFinal: false, counts };
     }
 
+    try {
+      await delivery.startReplyLifecycle();
+    } catch (error) {
+      logVerbose(
+        `dispatch-acp: start reply lifecycle failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+
+    await acpManager.runTurn({
+      cfg: params.cfg,
+      sessionKey: canonicalSessionKey,
+      text: promptText,
+      attachments: attachments.length > 0 ? attachments : undefined,
+      mode: "prompt",
+      requestId: resolveAcpRequestId(params.ctx),
+      ...(params.abortSignal ? { signal: params.abortSignal } : {}),
+      onEvent: async (event) => await projector.onEvent(event),
+    });
+
+    await projector.flush(true);
+    queuedFinal =
+      (await finalizeAcpTurnOutput({
+        cfg: params.cfg,
+        sessionKey: canonicalSessionKey,
+        delivery,
+        inboundAudio: params.inboundAudio,
+        sessionTtsAuto: params.sessionTtsAuto,
+        ttsChannel: params.ttsChannel,
+        shouldEmitResolvedIdentityNotice,
+      })) || queuedFinal;
+
     const counts = params.dispatcher.getQueuedCounts();
-    counts.tool += routedCounts.tool;
-    counts.block += routedCounts.block;
-    counts.final += routedCounts.final;
+    delivery.applyRoutedCounts(counts);
     const acpStats = acpManager.getObservabilitySnapshot(params.cfg);
     logVerbose(
       `acp-dispatch: session=${sessionKey} outcome=ok latencyMs=${Date.now() - acpDispatchStartedAt} queueDepth=${acpStats.turns.queueDepth} activeRuntimes=${acpStats.runtimeCache.activeSessions}`,
@@ -357,15 +480,17 @@ export async function tryDispatchAcpReply(params: {
       fallbackCode: "ACP_TURN_FAILED",
       fallbackMessage: "ACP turn failed before completion.",
     });
-    const delivered = await deliverAcpPayload("final", {
+    await maybeUnbindStaleBoundConversations({
+      targetSessionKey: canonicalSessionKey,
+      error: acpError,
+    });
+    const delivered = await delivery.deliver("final", {
       text: formatAcpRuntimeErrorText(acpError),
       isError: true,
     });
     queuedFinal = queuedFinal || delivered;
     const counts = params.dispatcher.getQueuedCounts();
-    counts.tool += routedCounts.tool;
-    counts.block += routedCounts.block;
-    counts.final += routedCounts.final;
+    delivery.applyRoutedCounts(counts);
     const acpStats = acpManager.getObservabilitySnapshot(params.cfg);
     logVerbose(
       `acp-dispatch: session=${sessionKey} outcome=error code=${acpError.code} latencyMs=${Date.now() - acpDispatchStartedAt} queueDepth=${acpStats.turns.queueDepth} activeRuntimes=${acpStats.runtimeCache.activeSessions}`,

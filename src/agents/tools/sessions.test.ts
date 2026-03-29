@@ -1,6 +1,6 @@
 import os from "node:os";
 import path from "node:path";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestRegistry } from "../../test-utils/channel-plugins.js";
 import { extractAssistantText, sanitizeTextContent } from "./sessions-helpers.js";
 
@@ -29,12 +29,38 @@ vi.mock("../../config/config.js", async (importOriginal) => {
     loadConfig: () => loadConfigMock() as never,
   };
 });
+vi.mock("./sessions-send-tool.a2a.js", () => ({
+  runSessionsSendA2AFlow: vi.fn(),
+}));
 
-import { createSessionsListTool } from "./sessions-list-tool.js";
-import { createSessionsSendTool } from "./sessions-send-tool.js";
-
+let createSessionsListTool: typeof import("./sessions-list-tool.js").createSessionsListTool;
+let createSessionsSendTool: typeof import("./sessions-send-tool.js").createSessionsSendTool;
 let resolveAnnounceTarget: (typeof import("./sessions-announce-target.js"))["resolveAnnounceTarget"];
 let setActivePluginRegistry: (typeof import("../../plugins/runtime.js"))["setActivePluginRegistry"];
+const MAIN_AGENT_SESSION_KEY = "agent:main:main";
+const MAIN_AGENT_CHANNEL = "whatsapp";
+
+type SessionsListResult = Awaited<
+  ReturnType<ReturnType<typeof import("./sessions-list-tool.js").createSessionsListTool>["execute"]>
+>;
+
+async function loadFreshSessionsToolModulesForTest() {
+  vi.resetModules();
+  vi.doMock("../../gateway/call.js", () => ({
+    callGateway: (opts: unknown) => callGatewayMock(opts),
+  }));
+  vi.doMock("../../config/config.js", async (importOriginal) => {
+    const actual = await importOriginal<typeof import("../../config/config.js")>();
+    return {
+      ...actual,
+      loadConfig: () => loadConfigMock() as never,
+    };
+  });
+  ({ createSessionsListTool } = await import("./sessions-list-tool.js"));
+  ({ createSessionsSendTool } = await import("./sessions-send-tool.js"));
+  ({ resolveAnnounceTarget } = await import("./sessions-announce-target.js"));
+  ({ setActivePluginRegistry } = await import("../../plugins/runtime.js"));
+}
 
 const installRegistry = async () => {
   setActivePluginRegistry(
@@ -82,6 +108,52 @@ const installRegistry = async () => {
   );
 };
 
+function createMainSessionsListTool() {
+  return createSessionsListTool({ agentSessionKey: MAIN_AGENT_SESSION_KEY });
+}
+
+async function executeMainSessionsList() {
+  return createMainSessionsListTool().execute("call1", {});
+}
+
+function createMainSessionsSendTool() {
+  return createSessionsSendTool({
+    agentSessionKey: MAIN_AGENT_SESSION_KEY,
+    agentChannel: MAIN_AGENT_CHANNEL,
+  });
+}
+
+function getFirstListedSession(result: SessionsListResult) {
+  const details = result.details as
+    | { sessions?: Array<{ key?: string; transcriptPath?: string }> }
+    | undefined;
+  return details?.sessions?.[0];
+}
+
+function expectWorkerTranscriptPath(
+  result: SessionsListResult,
+  params: { containsPath: string; sessionId: string },
+) {
+  const session = getFirstListedSession(result);
+  expect(session).toMatchObject({ key: "agent:worker:main" });
+  const transcriptPath = String(session?.transcriptPath ?? "");
+  expect(path.normalize(transcriptPath)).toContain(path.normalize(params.containsPath));
+  expect(transcriptPath).toMatch(new RegExp(`${params.sessionId}\\.jsonl$`));
+}
+
+async function withStubbedStateDir<T>(
+  name: string,
+  run: (stateDir: string) => Promise<T>,
+): Promise<T> {
+  const stateDir = path.join(os.tmpdir(), name);
+  vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+  try {
+    return await run(stateDir);
+  } finally {
+    vi.unstubAllEnvs();
+  }
+}
+
 describe("sanitizeTextContent", () => {
   it("strips minimax tool call XML and downgraded markers", () => {
     const input =
@@ -100,17 +172,13 @@ describe("sanitizeTextContent", () => {
   });
 });
 
-beforeAll(async () => {
-  ({ resolveAnnounceTarget } = await import("./sessions-announce-target.js"));
-  ({ setActivePluginRegistry } = await import("../../plugins/runtime.js"));
-});
-
-beforeEach(() => {
+beforeEach(async () => {
   loadConfigMock.mockReset();
   loadConfigMock.mockReturnValue({
     session: { scope: "per-sender", mainKey: "main" },
     tools: { agentToAgent: { enabled: false } },
   });
+  await loadFreshSessionsToolModulesForTest();
 });
 
 describe("extractAssistantText", () => {
@@ -149,6 +217,16 @@ describe("extractAssistantText", () => {
       "Firebase downgraded us to the free Spark plan. Check whether billing should be re-enabled.",
     );
   });
+
+  it("preserves successful turns with stale background errorMessage", () => {
+    const message = {
+      role: "assistant",
+      stopReason: "end_turn",
+      errorMessage: "insufficient credits for embedding model",
+      content: [{ type: "text", text: "Handle payment required errors in your API." }],
+    };
+    expect(extractAssistantText(message)).toBe("Handle payment required errors in your API.");
+  });
 });
 
 describe("resolveAnnounceTarget", () => {
@@ -162,7 +240,7 @@ describe("resolveAnnounceTarget", () => {
       sessionKey: "agent:main:discord:group:dev",
       displayKey: "agent:main:discord:group:dev",
     });
-    expect(target).toEqual({ channel: "discord", to: "channel:dev" });
+    expect(target).toEqual({ channel: "discord", to: "group:dev" });
     expect(callGatewayMock).not.toHaveBeenCalled();
   });
 
@@ -194,6 +272,31 @@ describe("resolveAnnounceTarget", () => {
     expect(first).toBeDefined();
     expect(first?.method).toBe("sessions.list");
   });
+
+  it("falls back to origin provider and accountId from sessions.list when legacy route fields are absent", async () => {
+    callGatewayMock.mockResolvedValueOnce({
+      sessions: [
+        {
+          key: "agent:main:whatsapp:group:123@g.us",
+          origin: {
+            provider: "whatsapp",
+            accountId: "work",
+          },
+          lastTo: "123@g.us",
+        },
+      ],
+    });
+
+    const target = await resolveAnnounceTarget({
+      sessionKey: "agent:main:whatsapp:group:123@g.us",
+      displayKey: "agent:main:whatsapp:group:123@g.us",
+    });
+    expect(target).toEqual({
+      channel: "whatsapp",
+      to: "123@g.us",
+      accountId: "work",
+    });
+  });
 });
 
 describe("sessions_list gating", () => {
@@ -209,11 +312,29 @@ describe("sessions_list gating", () => {
   });
 
   it("filters out other agents when tools.agentToAgent.enabled is false", async () => {
-    const tool = createSessionsListTool({ agentSessionKey: "agent:main:main" });
+    const tool = createMainSessionsListTool();
     const result = await tool.execute("call1", {});
     expect(result.details).toMatchObject({
       count: 1,
-      sessions: [{ key: "agent:main:main" }],
+      sessions: [{ key: MAIN_AGENT_SESSION_KEY }],
+    });
+  });
+
+  it("keeps literal current keys for message previews", async () => {
+    callGatewayMock.mockReset();
+    callGatewayMock
+      .mockResolvedValueOnce({
+        path: "/tmp/sessions.json",
+        sessions: [{ key: "current", kind: "direct" }],
+      })
+      .mockResolvedValueOnce({ sessions: [{ key: "current" }] })
+      .mockResolvedValueOnce({ messages: [{ role: "assistant", content: [] }] });
+
+    await createMainSessionsListTool().execute("call1", { messageLimit: 1 });
+
+    expect(callGatewayMock).toHaveBeenLastCalledWith({
+      method: "chat.history",
+      params: { sessionKey: "current", limit: 1 },
     });
   });
 });
@@ -231,10 +352,7 @@ describe("sessions_list transcriptPath resolution", () => {
   });
 
   it("resolves cross-agent transcript paths from agent defaults when gateway store path is relative", async () => {
-    const stateDir = path.join(os.tmpdir(), "openclaw-state-relative");
-    vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
-
-    try {
+    await withStubbedStateDir("openclaw-state-relative", async () => {
       callGatewayMock.mockResolvedValueOnce({
         path: "agents/main/sessions/sessions.json",
         sessions: [
@@ -246,27 +364,16 @@ describe("sessions_list transcriptPath resolution", () => {
         ],
       });
 
-      const tool = createSessionsListTool({ agentSessionKey: "agent:main:main" });
-      const result = await tool.execute("call1", {});
-
-      const details = result.details as
-        | { sessions?: Array<{ key?: string; transcriptPath?: string }> }
-        | undefined;
-      const session = details?.sessions?.[0];
-      expect(session).toMatchObject({ key: "agent:worker:main" });
-      const transcriptPath = String(session?.transcriptPath ?? "");
-      expect(path.normalize(transcriptPath)).toContain(path.join("agents", "worker", "sessions"));
-      expect(transcriptPath).toMatch(/sess-worker\.jsonl$/);
-    } finally {
-      vi.unstubAllEnvs();
-    }
+      const result = await executeMainSessionsList();
+      expectWorkerTranscriptPath(result, {
+        containsPath: path.join("agents", "worker", "sessions"),
+        sessionId: "sess-worker",
+      });
+    });
   });
 
   it("resolves transcriptPath even when sessions.list does not return a store path", async () => {
-    const stateDir = path.join(os.tmpdir(), "openclaw-state-no-path");
-    vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
-
-    try {
+    await withStubbedStateDir("openclaw-state-no-path", async () => {
       callGatewayMock.mockResolvedValueOnce({
         sessions: [
           {
@@ -277,27 +384,16 @@ describe("sessions_list transcriptPath resolution", () => {
         ],
       });
 
-      const tool = createSessionsListTool({ agentSessionKey: "agent:main:main" });
-      const result = await tool.execute("call1", {});
-
-      const details = result.details as
-        | { sessions?: Array<{ key?: string; transcriptPath?: string }> }
-        | undefined;
-      const session = details?.sessions?.[0];
-      expect(session).toMatchObject({ key: "agent:worker:main" });
-      const transcriptPath = String(session?.transcriptPath ?? "");
-      expect(path.normalize(transcriptPath)).toContain(path.join("agents", "worker", "sessions"));
-      expect(transcriptPath).toMatch(/sess-worker-no-path\.jsonl$/);
-    } finally {
-      vi.unstubAllEnvs();
-    }
+      const result = await executeMainSessionsList();
+      expectWorkerTranscriptPath(result, {
+        containsPath: path.join("agents", "worker", "sessions"),
+        sessionId: "sess-worker-no-path",
+      });
+    });
   });
 
   it("falls back to agent defaults when gateway path is non-string", async () => {
-    const stateDir = path.join(os.tmpdir(), "openclaw-state-non-string-path");
-    vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
-
-    try {
+    await withStubbedStateDir("openclaw-state-non-string-path", async () => {
       callGatewayMock.mockResolvedValueOnce({
         path: { raw: "agents/main/sessions/sessions.json" },
         sessions: [
@@ -309,27 +405,16 @@ describe("sessions_list transcriptPath resolution", () => {
         ],
       });
 
-      const tool = createSessionsListTool({ agentSessionKey: "agent:main:main" });
-      const result = await tool.execute("call1", {});
-
-      const details = result.details as
-        | { sessions?: Array<{ key?: string; transcriptPath?: string }> }
-        | undefined;
-      const session = details?.sessions?.[0];
-      expect(session).toMatchObject({ key: "agent:worker:main" });
-      const transcriptPath = String(session?.transcriptPath ?? "");
-      expect(path.normalize(transcriptPath)).toContain(path.join("agents", "worker", "sessions"));
-      expect(transcriptPath).toMatch(/sess-worker-shape\.jsonl$/);
-    } finally {
-      vi.unstubAllEnvs();
-    }
+      const result = await executeMainSessionsList();
+      expectWorkerTranscriptPath(result, {
+        containsPath: path.join("agents", "worker", "sessions"),
+        sessionId: "sess-worker-shape",
+      });
+    });
   });
 
   it("falls back to agent defaults when gateway path is '(multiple)'", async () => {
-    const stateDir = path.join(os.tmpdir(), "openclaw-state-multiple");
-    vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
-
-    try {
+    await withStubbedStateDir("openclaw-state-multiple", async (stateDir) => {
       callGatewayMock.mockResolvedValueOnce({
         path: "(multiple)",
         sessions: [
@@ -341,22 +426,12 @@ describe("sessions_list transcriptPath resolution", () => {
         ],
       });
 
-      const tool = createSessionsListTool({ agentSessionKey: "agent:main:main" });
-      const result = await tool.execute("call1", {});
-
-      const details = result.details as
-        | { sessions?: Array<{ key?: string; transcriptPath?: string }> }
-        | undefined;
-      const session = details?.sessions?.[0];
-      expect(session).toMatchObject({ key: "agent:worker:main" });
-      const transcriptPath = String(session?.transcriptPath ?? "");
-      expect(path.normalize(transcriptPath)).toContain(
-        path.join(stateDir, "agents", "worker", "sessions"),
-      );
-      expect(transcriptPath).toMatch(/sess-worker-multiple\.jsonl$/);
-    } finally {
-      vi.unstubAllEnvs();
-    }
+      const result = await executeMainSessionsList();
+      expectWorkerTranscriptPath(result, {
+        containsPath: path.join(stateDir, "agents", "worker", "sessions"),
+        sessionId: "sess-worker-multiple",
+      });
+    });
   });
 
   it("resolves absolute {agentId} template paths per session agent", async () => {
@@ -373,18 +448,44 @@ describe("sessions_list transcriptPath resolution", () => {
       ],
     });
 
-    const tool = createSessionsListTool({ agentSessionKey: "agent:main:main" });
-    const result = await tool.execute("call1", {});
-
-    const details = result.details as
-      | { sessions?: Array<{ key?: string; transcriptPath?: string }> }
-      | undefined;
-    const session = details?.sessions?.[0];
-    expect(session).toMatchObject({ key: "agent:worker:main" });
-    const transcriptPath = String(session?.transcriptPath ?? "");
+    const result = await executeMainSessionsList();
     const expectedSessionsDir = path.dirname(templateStorePath.replace("{agentId}", "worker"));
-    expect(path.normalize(transcriptPath)).toContain(path.normalize(expectedSessionsDir));
-    expect(transcriptPath).toMatch(/sess-worker-template\.jsonl$/);
+    expectWorkerTranscriptPath(result, {
+      containsPath: expectedSessionsDir,
+      sessionId: "sess-worker-template",
+    });
+  });
+});
+
+describe("sessions_list channel derivation", () => {
+  beforeEach(() => {
+    callGatewayMock.mockClear();
+    loadConfigMock.mockReturnValue({
+      session: { scope: "per-sender", mainKey: "main" },
+      tools: {
+        agentToAgent: { enabled: true },
+        sessions: { visibility: "all" },
+      },
+    });
+  });
+
+  it("falls back to origin.provider when the legacy top-level channel field is missing", async () => {
+    callGatewayMock.mockResolvedValueOnce({
+      path: "/tmp/sessions.json",
+      sessions: [
+        {
+          key: "agent:main:discord:group:ops",
+          kind: "group",
+          origin: { provider: "discord" },
+        },
+      ],
+    });
+
+    const result = await executeMainSessionsList();
+
+    expect(result.details).toMatchObject({
+      sessions: [{ key: "agent:main:discord:group:ops", channel: "discord" }],
+    });
   });
 });
 
@@ -394,10 +495,7 @@ describe("sessions_send gating", () => {
   });
 
   it("returns an error when neither sessionKey nor label is provided", async () => {
-    const tool = createSessionsSendTool({
-      agentSessionKey: "agent:main:main",
-      agentChannel: "whatsapp",
-    });
+    const tool = createMainSessionsSendTool();
 
     const result = await tool.execute("call-missing-target", {
       message: "hi",
@@ -413,10 +511,7 @@ describe("sessions_send gating", () => {
 
   it("returns an error when label resolution fails", async () => {
     callGatewayMock.mockRejectedValueOnce(new Error("No session found with label: nope"));
-    const tool = createSessionsSendTool({
-      agentSessionKey: "agent:main:main",
-      agentChannel: "whatsapp",
-    });
+    const tool = createMainSessionsSendTool();
 
     const result = await tool.execute("call-missing-label", {
       label: "nope",
@@ -435,10 +530,7 @@ describe("sessions_send gating", () => {
   });
 
   it("blocks cross-agent sends when tools.agentToAgent.enabled is false", async () => {
-    const tool = createSessionsSendTool({
-      agentSessionKey: "agent:main:main",
-      agentChannel: "whatsapp",
-    });
+    const tool = createMainSessionsSendTool();
 
     const result = await tool.execute("call1", {
       sessionKey: "agent:other:main",
@@ -449,5 +541,49 @@ describe("sessions_send gating", () => {
     expect(callGatewayMock).toHaveBeenCalledTimes(1);
     expect(callGatewayMock.mock.calls[0]?.[0]).toMatchObject({ method: "sessions.list" });
     expect(result.details).toMatchObject({ status: "forbidden" });
+  });
+
+  it("does not reuse a stale assistant reply when no new reply appears", async () => {
+    const tool = createMainSessionsSendTool();
+    let historyCalls = 0;
+    const staleAssistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "older reply from a previous run" }],
+      timestamp: 20,
+    };
+
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: Record<string, unknown> };
+      if (request.method === "sessions.list") {
+        return {
+          path: "/tmp/sessions.json",
+          sessions: [{ key: MAIN_AGENT_SESSION_KEY, kind: "direct" }],
+        };
+      }
+      if (request.method === "agent") {
+        return { runId: "run-stale-send", acceptedAt: 123 };
+      }
+      if (request.method === "agent.wait") {
+        return { runId: "run-stale-send", status: "ok" };
+      }
+      if (request.method === "chat.history") {
+        historyCalls += 1;
+        return { messages: [staleAssistantMessage] };
+      }
+      return {};
+    });
+
+    const result = await tool.execute("call-stale-send", {
+      sessionKey: MAIN_AGENT_SESSION_KEY,
+      message: "ping",
+      timeoutSeconds: 1,
+    });
+
+    expect(historyCalls).toBe(2);
+    expect(result.details).toMatchObject({
+      status: "ok",
+      reply: undefined,
+      sessionKey: MAIN_AGENT_SESSION_KEY,
+    });
   });
 });

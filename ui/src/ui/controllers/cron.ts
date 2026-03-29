@@ -18,6 +18,10 @@ import type {
 } from "../types.ts";
 import { CRON_CHANNEL_LAST } from "../ui-types.ts";
 import type { CronFormState } from "../ui-types.ts";
+import {
+  formatMissingOperatorReadScopeMessage,
+  isMissingOperatorReadScopeError,
+} from "./scope-errors.ts";
 
 export type CronFieldKey =
   | "name"
@@ -84,7 +88,7 @@ export type CronModelSuggestionsState = {
 export function supportsAnnounceDelivery(
   form: Pick<CronFormState, "sessionTarget" | "payloadKind">,
 ) {
-  return form.sessionTarget === "isolated" && form.payloadKind === "agentTurn";
+  return form.sessionTarget !== "main" && form.payloadKind === "agentTurn";
 }
 
 export function normalizeCronFormState(form: CronFormState): CronFormState {
@@ -183,7 +187,12 @@ export async function loadCronStatus(state: CronState) {
     const res = await state.client.request<CronStatus>("cron.status", {});
     state.cronStatus = res;
   } catch (err) {
-    state.cronError = String(err);
+    if (isMissingOperatorReadScopeError(err)) {
+      state.cronStatus = null;
+      state.cronError = formatMissingOperatorReadScopeMessage("cron status");
+    } else {
+      state.cronError = String(err);
+    }
   }
 }
 
@@ -434,6 +443,7 @@ function jobToForm(job: CronJob, prev: CronFormState): CronFormState {
     name: job.name,
     description: job.description ?? "",
     agentId: job.agentId ?? "",
+    sessionKey: job.sessionKey ?? "",
     clearAgent: false,
     enabled: job.enabled,
     deleteAfterRun: job.deleteAfterRun ?? false,
@@ -452,9 +462,12 @@ function jobToForm(job: CronJob, prev: CronFormState): CronFormState {
     payloadText: job.payload.kind === "systemEvent" ? job.payload.text : job.payload.message,
     payloadModel: job.payload.kind === "agentTurn" ? (job.payload.model ?? "") : "",
     payloadThinking: job.payload.kind === "agentTurn" ? (job.payload.thinking ?? "") : "",
+    payloadLightContext:
+      job.payload.kind === "agentTurn" ? job.payload.lightContext === true : false,
     deliveryMode: job.delivery?.mode ?? "none",
     deliveryChannel: job.delivery?.channel ?? CRON_CHANNEL_LAST,
     deliveryTo: job.delivery?.to ?? "",
+    deliveryAccountId: job.delivery?.accountId ?? "",
     deliveryBestEffort: job.delivery?.bestEffort ?? false,
     failureAlertMode:
       failureAlert === false
@@ -477,6 +490,12 @@ function jobToForm(job: CronJob, prev: CronFormState): CronFormState {
         ? (failureAlert.channel ?? CRON_CHANNEL_LAST)
         : CRON_CHANNEL_LAST,
     failureAlertTo: failureAlert && typeof failureAlert === "object" ? (failureAlert.to ?? "") : "",
+    failureAlertDeliveryMode:
+      failureAlert && typeof failureAlert === "object"
+        ? (failureAlert.mode ?? "announce")
+        : "announce",
+    failureAlertAccountId:
+      failureAlert && typeof failureAlert === "object" ? (failureAlert.accountId ?? "") : "",
     timeoutSeconds:
       job.payload.kind === "agentTurn" && typeof job.payload.timeoutSeconds === "number"
         ? String(job.payload.timeoutSeconds)
@@ -555,6 +574,7 @@ export function buildCronPayload(form: CronFormState) {
     model?: string;
     thinking?: string;
     timeoutSeconds?: number;
+    lightContext?: boolean;
   } = { kind: "agentTurn", message };
   const model = form.payloadModel.trim();
   if (model) {
@@ -568,6 +588,9 @@ export function buildCronPayload(form: CronFormState) {
   if (timeoutSeconds > 0) {
     payload.timeoutSeconds = timeoutSeconds;
   }
+  if (form.payloadLightContext) {
+    payload.lightContext = true;
+  }
   return payload;
 }
 
@@ -579,16 +602,27 @@ function buildFailureAlert(form: CronFormState) {
     return undefined;
   }
   const after = toNumber(form.failureAlertAfter.trim(), 0);
-  const cooldownSeconds = toNumber(form.failureAlertCooldownSeconds.trim(), 0);
-  return {
+  const cooldownRaw = form.failureAlertCooldownSeconds.trim();
+  const cooldownSeconds = cooldownRaw.length > 0 ? toNumber(cooldownRaw, 0) : undefined;
+  const cooldownMs =
+    cooldownSeconds !== undefined && Number.isFinite(cooldownSeconds) && cooldownSeconds >= 0
+      ? Math.floor(cooldownSeconds * 1000)
+      : undefined;
+  const deliveryMode = form.failureAlertDeliveryMode;
+  const accountId = form.failureAlertAccountId.trim();
+  const patch: Record<string, unknown> = {
     after: after > 0 ? Math.floor(after) : undefined,
     channel: form.failureAlertChannel.trim() || CRON_CHANNEL_LAST,
     to: form.failureAlertTo.trim() || undefined,
-    cooldownMs:
-      Number.isFinite(cooldownSeconds) && cooldownSeconds >= 0
-        ? Math.floor(cooldownSeconds * 1000)
-        : undefined,
+    ...(cooldownMs !== undefined ? { cooldownMs } : {}),
   };
+  // Always include mode and accountId so users can switch/clear them
+  if (deliveryMode) {
+    patch.mode = deliveryMode;
+  }
+  // Include accountId if explicitly set, or send undefined to allow clearing
+  patch.accountId = accountId || undefined;
+  return patch;
 }
 
 export async function addCronJob(state: CronState) {
@@ -610,6 +644,20 @@ export async function addCronJob(state: CronState) {
 
     const schedule = buildCronSchedule(form);
     const payload = buildCronPayload(form);
+    const editingJob = state.cronEditingJobId
+      ? state.cronJobs.find((job) => job.id === state.cronEditingJobId)
+      : undefined;
+    if (payload.kind === "agentTurn") {
+      const existingLightContext =
+        editingJob?.payload.kind === "agentTurn" ? editingJob.payload.lightContext : undefined;
+      if (
+        !form.payloadLightContext &&
+        state.cronEditingJobId &&
+        existingLightContext !== undefined
+      ) {
+        payload.lightContext = false;
+      }
+    }
     const selectedDeliveryMode = form.deliveryMode;
     const delivery =
       selectedDeliveryMode && selectedDeliveryMode !== "none"
@@ -620,15 +668,22 @@ export async function addCronJob(state: CronState) {
                 ? form.deliveryChannel.trim() || "last"
                 : undefined,
             to: form.deliveryTo.trim() || undefined,
+            accountId:
+              selectedDeliveryMode === "announce" ? form.deliveryAccountId.trim() : undefined,
             bestEffort: form.deliveryBestEffort,
           }
-        : undefined;
+        : selectedDeliveryMode === "none"
+          ? ({ mode: "none" } as const)
+          : undefined;
     const failureAlert = buildFailureAlert(form);
     const agentId = form.clearAgent ? null : form.agentId.trim();
+    const sessionKeyRaw = form.sessionKey.trim();
+    const sessionKey = sessionKeyRaw || (editingJob?.sessionKey ? null : undefined);
     const job = {
       name: form.name.trim(),
       description: form.description.trim(),
       agentId: agentId === null ? null : agentId || undefined,
+      sessionKey,
       enabled: form.enabled,
       deleteAfterRun: form.deleteAfterRun,
       schedule,
@@ -677,14 +732,14 @@ export async function toggleCronJob(state: CronState, job: CronJob, enabled: boo
   }
 }
 
-export async function runCronJob(state: CronState, job: CronJob) {
+export async function runCronJob(state: CronState, job: CronJob, mode: "force" | "due" = "force") {
   if (!state.client || !state.connected || state.cronBusy) {
     return;
   }
   state.cronBusy = true;
   state.cronError = null;
   try {
-    await state.client.request("cron.run", { id: job.id, mode: "force" });
+    await state.client.request("cron.run", { id: job.id, mode });
     if (state.cronRunsScope === "all") {
       await loadCronRuns(state, null);
     } else {
